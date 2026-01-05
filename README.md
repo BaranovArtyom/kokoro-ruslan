@@ -283,3 +283,18 @@ This training script is designed for use with the Ruslan Russian speech corpus a
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
+
+
+## Рекомендуемые параметры для A100 80GB (рабочие)
+Стартовый безопасный конфиг
+python training.py \
+  --corpus ./data/ruslan_corpus \
+  --output ./models/kokoro_russian_v1 \
+  --batch-size 32 \
+  --epochs 120 \
+  --learning-rate 3e-4 \
+  --save-every 5
+
+Агрессивный (после стабилизации)
+--batch-size 48
+--mixed_precision_dtype bfloat16
