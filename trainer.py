@@ -207,6 +207,27 @@ class KokoroTrainer:
         else:
             return torch.cuda.amp.autocast(enabled=False)
 
+    def has_nan_or_inf(self, tensor: torch.Tensor, name: str) -> bool:
+        if not torch.isfinite(tensor).all():
+            nan = torch.isnan(tensor).sum().item()
+            inf = torch.isinf(tensor).sum().item()
+            logger.critical(
+                f"❌ NaN/Inf detected in {name}: NaN={nan}, Inf={inf}"
+            )
+            return True
+        return False
+
+
+    def model_has_nan(self) -> bool:
+        nan_count = 0
+        for p in self.model.parameters():
+            if not torch.isfinite(p).all():
+                nan_count += 1
+        if nan_count > 0:
+            logger.critical(f"❌ MODEL CORRUPTED: {nan_count} tensors contain NaN/Inf")
+            return True
+        return False
+
 
     def adaptive_memory_cleanup(self, batch_idx: int, force: bool = False) -> Dict[str, Any]:
         """Perform adaptive memory cleanup"""
@@ -556,40 +577,66 @@ class KokoroTrainer:
         elif self.device.type == DeviceType.MPS.value:
             torch.mps.empty_cache()
 
-    def _calculate_losses(self, predicted_mel, predicted_log_durations, predicted_stop_logits,
-                         mel_specs, phoneme_durations, stop_token_targets,
-                         mel_lengths, phoneme_lengths):
-        """Calculate losses with masking (extracted for reuse)"""
-        # Mel Spectrogram Loss
-        max_mel_len_batch = mel_specs.size(1)
-        mel_mask = torch.arange(max_mel_len_batch, device=self.device).expand(
-            len(mel_lengths), max_mel_len_batch) < mel_lengths.unsqueeze(1)
-        mel_mask = mel_mask.unsqueeze(-1).expand_as(predicted_mel).float()
+    def _calculate_losses(
+        self,
+        predicted_mel,
+        predicted_log_durations,
+        predicted_stop_logits,
+        mel_specs,
+        phoneme_durations,
+        stop_token_targets,
+        mel_lengths,
+        phoneme_lengths,
+    ):
+        """Numerically safe loss computation (NO NaNs)"""
 
-        loss_mel_unreduced = self.criterion_mel(predicted_mel, mel_specs)
-        loss_mel = (loss_mel_unreduced * mel_mask).sum() / mel_mask.sum()
+        # ===== MEL LOSS =====
+        max_mel_len = mel_specs.size(1)
+        mel_mask = (
+            torch.arange(max_mel_len, device=self.device)
+            .unsqueeze(0)
+            < mel_lengths.unsqueeze(1)
+        ).unsqueeze(-1)
 
-        # Duration Loss
-        max_phoneme_len_batch = phoneme_durations.size(1)
-        phoneme_mask = torch.arange(max_phoneme_len_batch, device=self.device).expand(
-            len(phoneme_lengths), max_phoneme_len_batch) < phoneme_lengths.unsqueeze(1)
-        phoneme_mask = phoneme_mask.float()
+        mel_mask = mel_mask.float()
 
-        target_log_durations = torch.log(phoneme_durations.float() + 1e-5)
-        loss_duration_unreduced = self.criterion_duration(predicted_log_durations, target_log_durations)
-        loss_duration = (loss_duration_unreduced * phoneme_mask).sum() / phoneme_mask.sum()
+        loss_mel = (
+            self.criterion_mel(predicted_mel, mel_specs) * mel_mask
+        ).sum() / mel_mask.sum().clamp(min=1.0)
 
-        # Stop Token Loss
-        stop_token_mask = mel_mask[:, :, 0]
-        loss_stop_token_unreduced = self.criterion_stop_token(predicted_stop_logits, stop_token_targets)
-        loss_stop_token = (loss_stop_token_unreduced * stop_token_mask).sum() / stop_token_mask.sum()
+        # ===== DURATION LOSS (CRITICAL FIX) =====
+        max_ph_len = phoneme_durations.size(1)
+        phoneme_mask = (
+            torch.arange(max_ph_len, device=self.device)
+            .unsqueeze(0)
+            < phoneme_lengths.unsqueeze(1)
+        ).float()
 
-        # Combine all losses
-        total_loss = (loss_mel +
-                     loss_duration * self.config.duration_loss_weight +
-                     loss_stop_token * self.config.stop_token_loss_weight)
+        # 🔒 ABSOLUTE PROTECTION
+        safe_durations = torch.clamp(phoneme_durations.float(), min=1.0)
+        target_log_durations = torch.log(safe_durations)
 
-        return total_loss, loss_mel, loss_duration, loss_stop_token
+        loss_duration = (
+            self.criterion_duration(predicted_log_durations, target_log_durations)
+            * phoneme_mask
+        ).sum() / phoneme_mask.sum().clamp(min=1.0)
+
+        # ===== STOP TOKEN LOSS =====
+        stop_mask = mel_mask[:, :, 0]
+        loss_stop = (
+            self.criterion_stop_token(predicted_stop_logits, stop_token_targets)
+            * stop_mask
+        ).sum() / stop_mask.sum().clamp(min=1.0)
+
+        total_loss = (
+            loss_mel
+            + loss_duration * self.config.duration_loss_weight
+            + loss_stop * self.config.stop_token_loss_weight
+        )
+
+        return total_loss, loss_mel, loss_duration, loss_stop
+
+
 
     def setup_checkpoint_resumption(self):
         """Handle checkpoint resumption with mixed precision state"""
@@ -648,6 +695,7 @@ class KokoroTrainer:
         torch.save(checkpoint, checkpoint_path)
         logger.info(f"Checkpoint saved to {checkpoint_path}")
 
+    
     def train_epoch(self, epoch: int) -> Tuple[float, float, float, float]:
         """Train for one epoch with enhanced profiling, mixed precision, and adaptive memory management"""
         self.model.train()
@@ -658,284 +706,145 @@ class KokoroTrainer:
 
         num_batches = len(self.dataloader)
 
-        # Determine if profiling for this epoch
         is_profiling_epoch = (epoch == self.config.profile_epoch_start) and self.config.enable_profiling
         enable_interbatch_profiling = getattr(self.config, 'enable_interbatch_profiling', False)
 
-        if is_profiling_epoch:
-            logger.info(f"Starting profiler for epoch {epoch+1} for {self.config.profile_steps} steps on {self.device_type}.")
-            self.reset_profiling_stats()
-            self.profiler = self.start_torch_profiler()
-            self.profiler.__enter__()
-        elif enable_interbatch_profiling:
-            logger.info(f"Starting interbatch profiling for epoch {epoch+1}")
-            self.interbatch_profiler.reset()
-
         progress_bar = tqdm(self.dataloader, desc=f"Epoch {epoch+1}/{self.config.num_epochs}")
+
         for batch_idx, batch in enumerate(progress_bar):
             try:
-                # Start interbatch profiling for this batch
-                if enable_interbatch_profiling or is_profiling_epoch:
-                    self.interbatch_profiler.start_batch()
-
-                # Adaptive memory cleanup check
                 cleanup_result = self.adaptive_memory_cleanup(batch_idx)
 
-                # If profiling, advance the profiler schedule
-                if is_profiling_epoch and self.profiler:
-                    self.profile_step()
-                    # Exit profiler early if we've collected enough data
-                    total_profile_steps = (self.config.profile_wait_steps +
-                                         self.config.profile_warmup_steps +
-                                         self.config.profile_steps)
-                    if batch_idx >= total_profile_steps:
-                        logger.info("Profiler collected enough steps. Generating report.")
-                        self.profiler.__exit__(None, None, None)
+                non_blocking = self.device.type == 'cuda'
+                mel_specs = batch['mel_specs'].to(self.device, non_blocking=non_blocking)
+                phoneme_indices = batch['phoneme_indices'].to(self.device, non_blocking=non_blocking)
+                phoneme_durations = batch['phoneme_durations'].to(self.device, non_blocking=non_blocking)
+                stop_token_targets = batch['stop_token_targets'].to(self.device, non_blocking=non_blocking)
+                mel_lengths = batch['mel_lengths'].to(self.device, non_blocking=non_blocking)
+                phoneme_lengths = batch['phoneme_lengths'].to(self.device, non_blocking=non_blocking)
 
-                        # Generate and analyze profiling report
-                        report = self.get_profiling_report()
-                        self.analyze_profiling_results(report)
+                self.optimizer.zero_grad(set_to_none=True)
 
-                        self.profiler = None
-                        is_profiling_epoch = False
-
-                # Data loading with interbatch profiling
-                if enable_interbatch_profiling or is_profiling_epoch:
-                    self.interbatch_profiler.start_data_loading()
-
-                with torch.profiler.record_function("Data_Loading"):
-                    # Use non_blocking only for CUDA
-                    non_blocking = self.device.type == 'cuda'
-                    mel_specs = batch['mel_specs'].to(self.device, non_blocking=non_blocking)
-                    phoneme_indices = batch['phoneme_indices'].to(self.device, non_blocking=non_blocking)
-                    phoneme_durations = batch['phoneme_durations'].to(self.device, non_blocking=non_blocking)
-                    stop_token_targets = batch['stop_token_targets'].to(self.device, non_blocking=non_blocking)
-                    mel_lengths = batch['mel_lengths'].to(self.device, non_blocking=non_blocking)
-                    phoneme_lengths = batch['phoneme_lengths'].to(self.device, non_blocking=non_blocking)
-
-                if enable_interbatch_profiling or is_profiling_epoch:
-                    self.interbatch_profiler.end_data_loading()
-
-                if is_profiling_epoch:
-                    self.log_memory_stats("data_loading")
-
-                with torch.profiler.record_function("Zero_Grad"):
-                    self.optimizer.zero_grad()
-
-                # Forward pass with mixed precision and interbatch profiling
-                if enable_interbatch_profiling or is_profiling_epoch:
-                    self.interbatch_profiler.start_forward_pass()
-
-                with torch.profiler.record_function("Model_Forward"):
-                    if self.use_mixed_precision:
-                        with self.get_autocast_context():
-                            predicted_mel, predicted_log_durations, predicted_stop_logits = \
-                                self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets)
-                    else:
+                # ===== FORWARD =====
+                if self.use_mixed_precision:
+                    with self.get_autocast_context():
                         predicted_mel, predicted_log_durations, predicted_stop_logits = \
                             self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets)
+                else:
+                    predicted_mel, predicted_log_durations, predicted_stop_logits = \
+                        self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets)
 
-                if enable_interbatch_profiling or is_profiling_epoch:
-                    self.interbatch_profiler.end_forward_pass()
+                # ===== HARD NaN CHECK (forward) =====
+                for name, tensor in {
+                    "predicted_mel": predicted_mel,
+                    "predicted_log_durations": predicted_log_durations,
+                    "predicted_stop_logits": predicted_stop_logits,
+                }.items():
+                    if not torch.isfinite(tensor).all():
+                        raise RuntimeError(f"NaN/Inf detected in {name}")
 
-                if is_profiling_epoch:
-                    self.log_memory_stats("forward_pass")
-
-                # Loss calculation with mixed precision
-                with torch.profiler.record_function("Loss_Calculation"):
-                    if self.use_mixed_precision:
-                        with self.get_autocast_context():
-                            total_loss, loss_mel, loss_duration, loss_stop_token = self._calculate_losses(
-                                predicted_mel, predicted_log_durations, predicted_stop_logits,
-                                mel_specs, phoneme_durations, stop_token_targets,
-                                mel_lengths, phoneme_lengths
-                            )
-                    else:
+                # ===== LOSS =====
+                if self.use_mixed_precision:
+                    with self.get_autocast_context():
                         total_loss, loss_mel, loss_duration, loss_stop_token = self._calculate_losses(
                             predicted_mel, predicted_log_durations, predicted_stop_logits,
                             mel_specs, phoneme_durations, stop_token_targets,
                             mel_lengths, phoneme_lengths
                         )
+                else:
+                    total_loss, loss_mel, loss_duration, loss_stop_token = self._calculate_losses(
+                        predicted_mel, predicted_log_durations, predicted_stop_logits,
+                        mel_specs, phoneme_durations, stop_token_targets,
+                        mel_lengths, phoneme_lengths
+                    )
 
-                if is_profiling_epoch:
-                    self.log_memory_stats("loss_calculation")
+                # ===== HARD NaN CHECK (loss) =====
+                if not torch.isfinite(total_loss):
+                    logger.critical("❌ NaN/Inf detected in total_loss — aborting training")
+                    self.save_checkpoint_with_scaler(epoch, float("inf"))
+                    raise RuntimeError("NaN loss")
 
-                # Backward pass with mixed precision and interbatch profiling
-                if enable_interbatch_profiling or is_profiling_epoch:
-                    self.interbatch_profiler.start_backward_pass()
-
-                with torch.profiler.record_function("Backward_Pass"):
-                    if self.use_mixed_precision:
-                        if self.device_type == 'cuda':
-                            self.scaler.scale(total_loss).backward()
-                        else:  # MPS
-                            scaled_loss = self.scaler.scale(total_loss)
-                            scaled_loss.backward()
+                # ===== BACKWARD =====
+                if self.use_mixed_precision:
+                    if self.device_type == 'cuda':
+                        self.scaler.scale(total_loss).backward()
                     else:
-                        total_loss.backward()
+                        scaled_loss = self.scaler.scale(total_loss)
+                        scaled_loss.backward()
+                else:
+                    total_loss.backward()
 
-                if enable_interbatch_profiling or is_profiling_epoch:
-                    self.interbatch_profiler.end_backward_pass()
+                # ===== OPTIMIZER STEP =====
+                if self.use_mixed_precision:
+                    if self.device_type == 'cuda':
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
 
-                if is_profiling_epoch:
-                    self.log_memory_stats("backward_pass")
+                        old_scale = self.scaler.get_scale()
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                        new_scale = self.scaler.get_scale()
 
-                # Optimizer step with mixed precision
-                with torch.profiler.record_function("Optimizer_Step"):
-                    if self.use_mixed_precision:
-                        if self.device_type == 'cuda':
-                            # CUDA path with built-in GradScaler
-                            self.scaler.unscale_(self.optimizer)
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        if new_scale < 1.0:
+                            logger.critical("❌ AMP scaler collapsed (<1.0). Training stopped.")
+                            raise RuntimeError("AMP scaler collapsed")
 
-                            old_scale = self.scaler.get_scale()
-                            self.scaler.step(self.optimizer)
-                            self.scaler.update()
-                            new_scale = self.scaler.get_scale()
+                    elif self.device_type == DeviceType.MPS.value:
+                        # MPS custom scaler path
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
 
-                            # Update mixed precision stats
-                            if new_scale != old_scale:
-                                self.mixed_precision_stats['scale_updates'] += 1
-                                if new_scale < old_scale:
-                                    self.mixed_precision_stats['scale_decreases'] += 1
-                                    self.mixed_precision_stats['overflow_count'] += 1
-                                else:
-                                    self.mixed_precision_stats['successful_steps'] += 1
-                            else:
-                                self.mixed_precision_stats['successful_steps'] += 1
+                        old_scale = self.scaler.get_scale()
+                        step_successful = self.scaler.step(self.optimizer)  # IMPORTANT
+                        self.scaler.update()
+                        new_scale = self.scaler.get_scale()
 
-                        else:  # MPS path with custom scaler
-                            # For MPS, clip gradients before unscaling
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        if not step_successful:
+                            logger.critical("❌ MPS scaler overflow/step skipped. Aborting (hard mode).")
+                            raise RuntimeError("MPS AMP step skipped/overflow")
 
-                            old_scale = self.scaler.get_scale()
-                            step_successful = self.scaler.step(self.optimizer)
-                            self.scaler.update()
-                            new_scale = self.scaler.get_scale()
+                        if new_scale < 1.0:
+                            logger.critical("❌ MPS scaler collapsed (<1.0). Training stopped.")
+                            raise RuntimeError("MPS scaler collapsed")
 
-                            # Update mixed precision stats
-                            if step_successful:
-                                self.mixed_precision_stats['successful_steps'] += 1
-                            else:
-                                self.mixed_precision_stats['skipped_steps'] += 1
-                                self.mixed_precision_stats['overflow_count'] += 1
-
-                            if new_scale != old_scale:
-                                self.mixed_precision_stats['scale_updates'] += 1
-                                if new_scale < old_scale:
-                                    self.mixed_precision_stats['scale_decreases'] += 1
                     else:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
                         self.optimizer.step()
+                else:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+                    self.optimizer.step()
 
-                if is_profiling_epoch:
-                    self.log_memory_stats("optimizer_step")
 
-                # End batch profiling
-                if enable_interbatch_profiling or is_profiling_epoch:
-                    batch_size = mel_specs.size(0)
-                    self.interbatch_profiler.end_batch(batch_size)
+                # ===== MODEL PARAM CHECK =====
+                for p in self.model.parameters():
+                    if not torch.isfinite(p).all():
+                        logger.critical("❌ NaN detected in model parameters")
+                        raise RuntimeError("Model corrupted (NaN weights)")
 
                 total_loss_epoch += total_loss.item()
                 mel_loss_epoch += loss_mel.item()
                 dur_loss_epoch += loss_duration.item()
                 stop_loss_epoch += loss_stop_token.item()
 
-                # Enhanced progress bar with mixed precision info and memory pressure
-                postfix_dict = {
-                    'total_loss': total_loss.item(),
-                    'mel_loss': loss_mel.item(),
-                    'dur_loss': loss_duration.item(),
-                    'stop_loss': loss_stop_token.item(),
-                    'lr': self.optimizer.param_groups[0]['lr']
-                }
+                progress_bar.set_postfix({
+                    'loss': f"{total_loss.item():.4f}",
+                    'mel': f"{loss_mel.item():.4f}",
+                    'dur': f"{loss_duration.item():.4f}",
+                    'stop': f"{loss_stop_token.item():.4f}",
+                    'lr': self.optimizer.param_groups[0]['lr'],
+                    'scale': f"{self.scaler.get_scale():.0f}" if self.use_mixed_precision else "-"
+                })
 
-                if self.use_mixed_precision:
-                    postfix_dict['scale'] = f"{self.scaler.get_scale():.0f}"
-                    if self.device_type == DeviceType.MPS.value:
-                        postfix_dict['device'] = 'MPS'
-
-                # Add memory pressure info if adaptive memory is enabled
-                if self.enable_adaptive_memory:
-                    postfix_dict['mem'] = cleanup_result.get('pressure_level', 'unknown')[:3]  # First 3 chars
-                    if cleanup_result.get('cleaned', False):
-                        postfix_dict['mem'] += '*'  # Indicate cleanup occurred
-
-                progress_bar.set_postfix(postfix_dict)
-
-                # Print memory management report periodically
-                if self.enable_adaptive_memory and batch_idx % self.memory_report_interval == 0 and batch_idx > 0:
-                    logger.info(f"Memory management stats at batch {batch_idx}:")
-                    report = self.memory_manager.get_memory_report()
-                    logger.info(f"  Current pressure: {report['current_pressure']}")
-                    logger.info(f"  Memory usage: {report.get('current_memory_usage_percent', 0):.1f}%")
-                    logger.info(f"  Cleanups performed: {report['cleanup_count']}")
-                    logger.info(f"  Cleanup overhead: {report['cleanup_overhead_percent']:.2f}%")
-
-                # Print interbatch profiling stats periodically
-                if enable_interbatch_profiling and batch_idx % getattr(self.config, 'interbatch_report_interval', 100) == 0 and batch_idx > 0:
-                    logger.info(f"Interbatch profiling stats at batch {batch_idx}:")
-                    stats = self.interbatch_profiler.get_statistics()
-                    logger.info(f"  Avg interbatch time: {stats.get('interbatch_mean_ms', 0):.1f}ms")
-                    logger.info(f"  Avg data loading time: {stats.get('data_loading_mean_ms', 0):.1f}ms")
-                    logger.info(f"  Throughput: {stats.get('throughput_samples_per_sec', 0):.2f} samples/sec")
-
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    logger.error(f"OOM error at batch {batch_idx} on {self.device_type}: {e}")
-
-                    # Try adaptive memory cleanup to recover
-                    can_continue = self.handle_oom_with_adaptive_cleanup(batch_idx, e)
-
-                    if can_continue:
-                        logger.info("Attempting to continue after OOM recovery")
-                        continue
-                    else:
-                        logger.error("Unable to recover from OOM error")
-                        raise e
-                else:
-                    logger.error(f"Runtime error in batch {batch_idx}: {e}")
-                    raise e
             except Exception as e:
-                logger.error(f"Error in batch {batch_idx}: {e}")
-                # Try emergency cleanup and continue
-                if self.enable_adaptive_memory:
-                    self.memory_manager.emergency_cleanup()
-                else:
-                    self.clear_device_cache()
-                continue
+                logger.critical(f"⛔ Training aborted at batch {batch_idx}: {e}")
+                raise
 
-        # Ensure profiler is exited if it was started but didn't complete its schedule
-        if self.profiler:
-            logger.info("Profiler exiting at end of epoch.")
-            self.profiler.__exit__(None, None, None)
-            # Generate final report
-            report = self.get_profiling_report()
-            self.analyze_profiling_results(report)
-            self.profiler = None
+        return (
+            total_loss_epoch / num_batches,
+            mel_loss_epoch / num_batches,
+            dur_loss_epoch / num_batches,
+            stop_loss_epoch / num_batches
+        )
 
-        # Print final interbatch profiling report for this epoch
-        if enable_interbatch_profiling:
-            logger.info(f"Final interbatch profiling report for epoch {epoch+1}:")
-            self.interbatch_profiler.print_report()
-
-        # Log mixed precision statistics for this epoch
-        if self.use_mixed_precision:
-            mp_stats = self.mixed_precision_stats
-            total_steps = mp_stats['successful_steps'] + mp_stats.get('skipped_steps', 0) + mp_stats['overflow_count']
-            if total_steps > 0:
-                success_rate = (mp_stats['successful_steps'] / total_steps) * 100
-                device_info = f"({self.device_type.upper()})"
-                logger.info(f"Mixed Precision Stats {device_info} - Success: {mp_stats['successful_steps']}, "
-                           f"Skipped: {mp_stats.get('skipped_steps', 0)}, "
-                           f"Overflows: {mp_stats['overflow_count']}, "
-                           f"Success Rate: {success_rate:.1f}%, "
-                           f"Current Scale: {self.scaler.get_scale():.0f}")
-
-        return (total_loss_epoch / num_batches,
-                mel_loss_epoch / num_batches,
-                dur_loss_epoch / num_batches,
-                stop_loss_epoch / num_batches)
 
     def train(self):
         """Main training function with mixed precision support and adaptive memory management"""
@@ -1138,7 +1047,7 @@ class KokoroTrainer:
                         if self.device_type == 'cuda':
                             # CUDA path with built-in GradScaler
                             self.scaler.unscale_(self.optimizer)
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
 
                             old_scale = self.scaler.get_scale()
                             self.scaler.step(self.optimizer)
@@ -1158,7 +1067,7 @@ class KokoroTrainer:
 
                         else:  # MPS path with custom scaler
                             # Clip gradients before unscaling for MPS
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
 
                             old_scale = self.scaler.get_scale()
                             step_successful = self.scaler.step(self.optimizer)
@@ -1234,7 +1143,7 @@ if __name__ == "__main__":
             self.output_dir = "output_models"
             self.num_epochs = 100
             self.batch_size = 16
-            self.learning_rate = 1e-4
+            self.learning_rate = 3e-5
             self.device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
             self.lr_T_0 = 20
             self.lr_T_mult = 2
