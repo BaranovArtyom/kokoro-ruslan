@@ -4,3 +4,8 @@ venv
 # misc
 .DS_Store
 
+models/
+
+__pycache__/
+
+.vscode/
