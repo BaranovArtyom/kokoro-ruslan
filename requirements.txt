@@ -74,3 +74,5 @@ pycparser==2.23
 # Optional (debug / plotting)
 # ===============================
 # matplotlib==3.8.4
+
+matplotlib==3.1.3
